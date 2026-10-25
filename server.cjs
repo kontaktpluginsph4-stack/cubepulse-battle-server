@@ -71,6 +71,7 @@ function publicRoom(room) {
     players: room.players.map(({ lastSeen, solves, ...p }) => ({
       ...p,
       solveCount: solves.length,
+      lastMs: solves.length ? solves[solves.length - 1] : null,
       avgMs: solves.length ? Math.round(solves.reduce((a, b) => a + b, 0) / solves.length) : null,
     })),
   };
