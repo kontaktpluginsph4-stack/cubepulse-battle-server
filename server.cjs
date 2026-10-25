@@ -9,6 +9,11 @@ const MAX_PLAYERS = 20;
 // Every round (every new scramble) has this much time. Anyone who has not solved
 // when it runs out is kicked from the room. (Set ROUND_TIME_MS on Render to change it.)
 const ROUND_TIME_MS = Number(process.env.ROUND_TIME_MS) || 2 * 60_000;
+// When every player has finished, the next scramble starts by itself after this short pause
+// (so everyone can see the final times). Set NEXT_ROUND_DELAY_MS on Render to change it; 0 = instant.
+const NEXT_ROUND_DELAY_MS = process.env.NEXT_ROUND_DELAY_MS !== undefined && process.env.NEXT_ROUND_DELAY_MS !== ""
+  ? Math.max(0, Number(process.env.NEXT_ROUND_DELAY_MS) || 0)
+  : 3000;
 const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player can be told why
 const PLAYER_TIMEOUT_MS = 20_000;      // no polling for 20s -> removed from the room
 const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
@@ -47,7 +52,7 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, timeMs: null, dnf: false, wins: 0, solves: [], lastSeen: Date.now() };
+  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, wins: 0, solves: [], lastSeen: Date.now() };
 }
 
 function publicRoom(room) {
@@ -60,6 +65,7 @@ function publicRoom(room) {
     scramble: room.scramble,
     roundWinnerId: room.roundWinnerId,
     roundEndsAt: room.roundEndsAt,   // epoch ms, null when no round is running
+    nextRoundAt: room.nextRoundAt,   // epoch ms of the automatic next scramble, null if the host has to start it
     roundMs: ROUND_TIME_MS,
     serverNow: Date.now(),           // lets the app line its countdown up with the server clock
     players: room.players.map(({ lastSeen, solves, ...p }) => ({
@@ -70,9 +76,12 @@ function publicRoom(room) {
   };
 }
 
-function finishRound(room) {
+// auto = true: the next scramble starts by itself after NEXT_ROUND_DELAY_MS.
+// auto = false (host pressed END ROUND): wait for the host to press NEXT ROUND.
+function finishRound(room, auto = true) {
   room.phase = "results";
   room.roundEndsAt = null;
+  room.nextRoundAt = auto ? Date.now() + NEXT_ROUND_DELAY_MS : null;
   for (const p of room.players) if (p.inRound && p.timeMs == null) p.dnf = true;
   const solved = room.players.filter((p) => p.timeMs != null).sort((a, b) => a.timeMs - b.timeMs);
   if (solved[0]) {
@@ -81,6 +90,23 @@ function finishRound(room) {
   } else {
     room.roundWinnerId = null;
   }
+}
+
+function startRound(room) {
+  room.round += 1;
+  room.phase = "round";
+  room.scramble = makeScramble();
+  room.roundWinnerId = null;
+  room.roundEndsAt = Date.now() + ROUND_TIME_MS;
+  room.nextRoundAt = null;
+  for (const p of room.players) { p.inRound = true; p.status = "inspecting"; p.timeMs = null; p.dnf = false; }
+}
+
+// Everyone finished and the short pause is over: new scramble, same room.
+function advanceRound(room) {
+  if (room.phase !== "results" || !room.nextRoundAt || Date.now() < room.nextRoundAt) return;
+  if (room.players.length === 0) return;
+  startRound(room);
 }
 
 function checkAllDone(room) {
@@ -104,7 +130,7 @@ function expireRound(room) {
     kickedPlayers.set(p.id, Date.now() + KICK_MEMORY_MS);
     removePlayer(room, p.id);
   }
-  if (rooms.has(room.id) && room.phase === "round") finishRound(room);
+  if (rooms.has(room.id) && room.phase === "round") finishRound(room, true);
 }
 
 function pruneRoom(room) {
@@ -129,6 +155,7 @@ function getRoom(source) {
   const id = String(source.roomId || "").toUpperCase();
   const room = rooms.get(id);
   if (room) expireRound(room); // enforce the time limit on every request
+  if (room && rooms.has(id)) advanceRound(room);
   if (!room || !rooms.has(id)) {
     throwIfKicked(source.playerId);
     throw new HttpError(404, "Room not found.");
@@ -161,6 +188,7 @@ const routes = {
       scramble: null,
       roundWinnerId: null,
       roundEndsAt: null,
+      nextRoundAt: null,
       players: [newPlayer(body.playerId, body.username)],
       lastActive: Date.now(),
     };
@@ -197,12 +225,15 @@ const routes = {
     const { room } = getMember(body);
     if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can start a round.");
     if (room.phase === "round") throw new HttpError(409, "A round is already running.");
-    room.round += 1;
-    room.phase = "round";
-    room.scramble = makeScramble();
-    room.roundWinnerId = null;
-    room.roundEndsAt = Date.now() + ROUND_TIME_MS;
-    for (const p of room.players) { p.inRound = true; p.timeMs = null; p.dnf = false; }
+    startRound(room);
+    return publicRoom(room);
+  },
+
+  // A player tells the room they started solving (the timer is running).
+  "POST /api/rooms/status": (body) => {
+    const { room, player } = getMember(body);
+    if (room.phase !== "round" || !player.inRound || player.timeMs != null || player.dnf) return publicRoom(room);
+    if (body.state === "solving") player.status = "solving";
     return publicRoom(room);
   },
 
@@ -214,6 +245,7 @@ const routes = {
     const ms = Math.round(Number(body.timeMs));
     if (!Number.isFinite(ms) || ms < 1 || ms > 60 * 60_000) throw new HttpError(400, "Invalid time.");
     player.timeMs = ms;
+    player.status = "done";
     player.solves.push(ms);
     checkAllDone(room);
     return publicRoom(room);
@@ -222,7 +254,7 @@ const routes = {
   "POST /api/rooms/end": (body) => {
     const { room } = getMember(body);
     if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can end the round.");
-    if (room.phase === "round") finishRound(room);
+    if (room.phase === "round") finishRound(room, false); // host ended it: the host starts the next one
     return publicRoom(room);
   },
 
@@ -275,7 +307,10 @@ const server = http.createServer((req, res) => {
 
 // enforce the round time limit every second
 setInterval(() => {
-  for (const room of [...rooms.values()]) expireRound(room);
+  for (const room of [...rooms.values()]) {
+    expireRound(room);
+    if (rooms.has(room.id)) advanceRound(room);
+  }
 }, 1000).unref();
 
 // clean up dead players / rooms
