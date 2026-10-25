@@ -1,0 +1,13 @@
+{
+  "name": "cubepulse-battle-server",
+  "version": "1.0.0",
+  "description": "Battle rooms server for CubePulse (create/join a room, up to 20 players)",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC"
+}

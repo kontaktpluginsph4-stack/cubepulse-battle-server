@@ -1,0 +1,241 @@
+// CubePulse battle server (rooms of up to 20 players).
+// No dependencies: only Node's built-in http module. Rooms live in memory, so
+// they are cleared whenever the server restarts or goes to sleep.
+
+const http = require("http");
+
+const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 20;
+const PLAYER_TIMEOUT_MS = 20_000;      // no polling for 20s -> removed from the room
+const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+
+const rooms = new Map();
+
+// ---------- helpers ----------
+function makeCode() {
+  let code;
+  do {
+    code = Array.from({ length: 5 }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
+  } while (rooms.has(code));
+  return code;
+}
+
+function makeScramble(len = 20) {
+  const faces = ["U", "D", "L", "R", "F", "B"];
+  const axis = { U: 0, D: 0, L: 1, R: 1, F: 2, B: 2 };
+  const mods = ["", "'", "2"];
+  const out = [];
+  while (out.length < len) {
+    const f = faces[Math.floor(Math.random() * 6)];
+    const last = out[out.length - 1];
+    const prev = out[out.length - 2];
+    if (last && last.f === f) continue;
+    if (last && prev && axis[last.f] === axis[f] && axis[prev.f] === axis[f]) continue;
+    out.push({ f, m: mods[Math.floor(Math.random() * 3)] });
+  }
+  return out.map((x) => x.f + x.m).join(" ");
+}
+
+function cleanName(n) {
+  return String(n || "Player").trim().slice(0, 20) || "Player";
+}
+
+function newPlayer(id, username) {
+  return { id, username: cleanName(username), inRound: false, timeMs: null, dnf: false, wins: 0, lastSeen: Date.now() };
+}
+
+function publicRoom(room) {
+  return {
+    id: room.id,
+    hostId: room.hostId,
+    maxPlayers: MAX_PLAYERS,
+    phase: room.phase,
+    round: room.round,
+    scramble: room.scramble,
+    roundWinnerId: room.roundWinnerId,
+    players: room.players.map(({ lastSeen, ...p }) => p),
+  };
+}
+
+function finishRound(room) {
+  room.phase = "results";
+  for (const p of room.players) if (p.inRound && p.timeMs == null) p.dnf = true;
+  const solved = room.players.filter((p) => p.timeMs != null).sort((a, b) => a.timeMs - b.timeMs);
+  if (solved[0]) {
+    solved[0].wins += 1;
+    room.roundWinnerId = solved[0].id;
+  } else {
+    room.roundWinnerId = null;
+  }
+}
+
+function checkAllDone(room) {
+  if (room.phase !== "round") return;
+  const active = room.players.filter((p) => p.inRound);
+  if (active.length > 0 && active.every((p) => p.timeMs != null || p.dnf)) finishRound(room);
+}
+
+function removePlayer(room, playerId) {
+  room.players = room.players.filter((p) => p.id !== playerId);
+  if (room.players.length === 0) { rooms.delete(room.id); return; }
+  if (room.hostId === playerId) room.hostId = room.players[0].id; // pass host to the next player
+  checkAllDone(room);
+}
+
+function pruneRoom(room) {
+  const now = Date.now();
+  for (const p of [...room.players]) {
+    if (now - p.lastSeen > PLAYER_TIMEOUT_MS) removePlayer(room, p.id);
+  }
+}
+
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+function getRoom(source) {
+  const room = rooms.get(String(source.roomId || "").toUpperCase());
+  if (!room) throw new HttpError(404, "Room not found.");
+  room.lastActive = Date.now();
+  return room;
+}
+
+function getMember(source) {
+  const room = getRoom(source);
+  const player = room.players.find((p) => p.id === source.playerId);
+  if (!player) throw new HttpError(403, "You are not in this room.");
+  player.lastSeen = Date.now();
+  return { room, player };
+}
+
+// ---------- routes ----------
+const routes = {
+  "POST /api/rooms/create": (body) => {
+    if (!body.playerId) throw new HttpError(400, "playerId is required.");
+    const room = {
+      id: makeCode(),
+      hostId: body.playerId,
+      phase: "lobby",
+      round: 0,
+      scramble: null,
+      roundWinnerId: null,
+      players: [newPlayer(body.playerId, body.username)],
+      lastActive: Date.now(),
+    };
+    rooms.set(room.id, room);
+    return publicRoom(room);
+  },
+
+  "POST /api/rooms/join": (body) => {
+    if (!body.playerId) throw new HttpError(400, "playerId is required.");
+    const room = getRoom(body);
+    pruneRoom(room);
+    if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
+
+    const existing = room.players.find((p) => p.id === body.playerId);
+    if (existing) {
+      existing.lastSeen = Date.now();
+      existing.username = cleanName(body.username);
+      return publicRoom(room);
+    }
+    if (room.players.length >= MAX_PLAYERS) throw new HttpError(409, `Room is full (${MAX_PLAYERS}/${MAX_PLAYERS}).`);
+    room.players.push(newPlayer(body.playerId, body.username)); // joins mid-round -> spectates until next round
+    return publicRoom(room);
+  },
+
+  "GET /api/rooms/state": (_body, query) => {
+    const { room } = getMember(query);
+    pruneRoom(room);
+    if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
+    return publicRoom(room);
+  },
+
+  "POST /api/rooms/start": (body) => {
+    const { room } = getMember(body);
+    if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can start a round.");
+    if (room.phase === "round") throw new HttpError(409, "A round is already running.");
+    room.round += 1;
+    room.phase = "round";
+    room.scramble = makeScramble();
+    room.roundWinnerId = null;
+    for (const p of room.players) { p.inRound = true; p.timeMs = null; p.dnf = false; }
+    return publicRoom(room);
+  },
+
+  "POST /api/rooms/submit": (body) => {
+    const { room, player } = getMember(body);
+    if (room.phase !== "round") throw new HttpError(409, "No round is running.");
+    if (!player.inRound) throw new HttpError(409, "You are spectating this round.");
+    if (player.timeMs != null || player.dnf) throw new HttpError(409, "Time already submitted.");
+    const ms = Math.round(Number(body.timeMs));
+    if (!Number.isFinite(ms) || ms < 1 || ms > 60 * 60_000) throw new HttpError(400, "Invalid time.");
+    player.timeMs = ms;
+    checkAllDone(room);
+    return publicRoom(room);
+  },
+
+  "POST /api/rooms/end": (body) => {
+    const { room } = getMember(body);
+    if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can end the round.");
+    if (room.phase === "round") finishRound(room);
+    return publicRoom(room);
+  },
+
+  "POST /api/rooms/leave": (body) => {
+    const room = rooms.get(String(body.roomId || "").toUpperCase());
+    if (room) removePlayer(room, body.playerId);
+    return { ok: true };
+  },
+
+  "GET /": () => ({ ok: true, service: "cubepulse-battle-server", rooms: rooms.size }),
+  "GET /health": () => ({ ok: true }),
+};
+
+// ---------- http server ----------
+function send(res, status, data) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
+  res.end(JSON.stringify(data));
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "OPTIONS") return send(res, 204, {});
+
+  const url = new URL(req.url, "http://localhost");
+  const handler = routes[`${req.method} ${url.pathname}`];
+  if (!handler) return send(res, 404, { error: "Not found." });
+
+  let raw = "";
+  req.on("data", (chunk) => {
+    raw += chunk;
+    if (raw.length > 100_000) req.destroy(); // tiny bodies only
+  });
+  req.on("end", () => {
+    try {
+      const body = raw ? JSON.parse(raw) : {};
+      const query = Object.fromEntries(url.searchParams);
+      send(res, 200, handler(body, query));
+    } catch (e) {
+      if (e instanceof HttpError) return send(res, e.status, { error: e.message });
+      if (e instanceof SyntaxError) return send(res, 400, { error: "Invalid JSON." });
+      console.error(e);
+      send(res, 500, { error: "Server error." });
+    }
+  });
+});
+
+// clean up dead players / rooms
+setInterval(() => {
+  const now = Date.now();
+  for (const room of [...rooms.values()]) {
+    pruneRoom(room);
+    if (rooms.has(room.id) && now - room.lastActive > ROOM_TIMEOUT_MS) rooms.delete(room.id);
+  }
+}, 10_000).unref();
+
+server.listen(PORT, () => console.log(`CubePulse battle server listening on ${PORT}`));
