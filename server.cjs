@@ -97,9 +97,10 @@ function startRound(room) {
   room.phase = "round";
   room.scramble = makeScramble();
   room.roundWinnerId = null;
-  room.roundEndsAt = Date.now() + ROUND_TIME_MS;
+  room.roundEndsAt = null; // no round time limit anymore: nobody is kicked for being slow
   room.nextRoundAt = null;
-  for (const p of room.players) { p.inRound = true; p.status = "inspecting"; p.timeMs = null; p.dnf = false; }
+  // Everyone starts as "idle" (shown as STAY) until they hold the timer (INSPECTING) or start solving (SOLVING).
+  for (const p of room.players) { p.inRound = true; p.status = "idle"; p.timeMs = null; p.dnf = false; }
 }
 
 // Everyone finished and the short pause is over: new scramble, same room.
@@ -122,16 +123,10 @@ function removePlayer(room, playerId) {
   checkAllDone(room);
 }
 
-// Time is up: everyone who has not solved is removed from the room.
-function expireRound(room) {
-  if (room.phase !== "round" || !room.roundEndsAt || Date.now() < room.roundEndsAt) return;
-  const late = room.players.filter((p) => p.inRound && p.timeMs == null && !p.dnf);
-  for (const p of late) {
-    kickedPlayers.set(p.id, Date.now() + KICK_MEMORY_MS);
-    removePlayer(room, p.id);
-  }
-  if (rooms.has(room.id) && room.phase === "round") finishRound(room, true);
-}
+// The 2-minute "kick if you do nothing" rule was removed on purpose.
+// Players who disconnect are still removed by pruneRoom (no polling for PLAYER_TIMEOUT_MS),
+// and the host can always press END ROUND.
+function expireRound(_room) {}
 
 function pruneRoom(room) {
   const now = Date.now();
@@ -233,7 +228,12 @@ const routes = {
   "POST /api/rooms/status": (body) => {
     const { room, player } = getMember(body);
     if (room.phase !== "round" || !player.inRound || player.timeMs != null || player.dnf) return publicRoom(room);
-    if (body.state === "solving") player.status = "solving";
+    // idle = doing nothing (STAY), inspecting = holding the timer, solving = timer running
+    if (body.state === "solving" || body.state === "inspecting" || body.state === "idle") {
+      // Never go back from "solving" to inspecting / idle by a late request.
+      if (player.status === "solving" && body.state !== "solving") return publicRoom(room);
+      player.status = body.state;
+    }
     return publicRoom(room);
   },
 
