@@ -52,7 +52,7 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, wins: 0, solves: [], lastSeen: Date.now() };
+  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now() };
 }
 
 function publicRoom(room) {
@@ -82,7 +82,7 @@ function finishRound(room, auto = true) {
   room.phase = "results";
   room.roundEndsAt = null;
   room.nextRoundAt = auto ? Date.now() + NEXT_ROUND_DELAY_MS : null;
-  for (const p of room.players) if (p.inRound && p.timeMs == null) p.dnf = true;
+  for (const p of room.players) if (p.inRound && p.timeMs == null) { p.dnf = true; p.lastMs = null; p.lastDnf = true; }
   const solved = room.players.filter((p) => p.timeMs != null).sort((a, b) => a.timeMs - b.timeMs);
   if (solved[0]) {
     solved[0].wins += 1;
@@ -245,6 +245,8 @@ const routes = {
     const ms = Math.round(Number(body.timeMs));
     if (!Number.isFinite(ms) || ms < 1 || ms > 60 * 60_000) throw new HttpError(400, "Invalid time.");
     player.timeMs = ms;
+    player.lastMs = ms;      // shown above "STAY" in the players panel during the next round
+    player.lastDnf = false;
     player.status = "done";
     player.solves.push(ms);
     checkAllDone(room);
