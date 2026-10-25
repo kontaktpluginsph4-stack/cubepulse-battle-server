@@ -15,7 +15,7 @@ const NEXT_ROUND_DELAY_MS = process.env.NEXT_ROUND_DELAY_MS !== undefined && pro
   ? Math.max(0, Number(process.env.NEXT_ROUND_DELAY_MS) || 0)
   : 3000;
 const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player can be told why
-const PLAYER_TIMEOUT_MS = 20_000;      // no polling for 20s -> removed from the room
+const PLAYER_TIMEOUT_MS = 10_000;      // no polling for 10s -> removed from the room (safety net; leaving the tab calls /leave right away)
 const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
 
