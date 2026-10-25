@@ -6,11 +6,16 @@ const http = require("http");
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 20;
+// Every round (every new scramble) has this much time. Anyone who has not solved
+// when it runs out is kicked from the room. (Set ROUND_TIME_MS on Render to change it.)
+const ROUND_TIME_MS = Number(process.env.ROUND_TIME_MS) || 2 * 60_000;
+const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player can be told why
 const PLAYER_TIMEOUT_MS = 20_000;      // no polling for 20s -> removed from the room
 const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
 
 const rooms = new Map();
+const kickedPlayers = new Map(); // playerId -> expires at
 
 // ---------- helpers ----------
 function makeCode() {
@@ -42,7 +47,7 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, timeMs: null, dnf: false, wins: 0, lastSeen: Date.now() };
+  return { id, username: cleanName(username), inRound: false, timeMs: null, dnf: false, wins: 0, solves: [], lastSeen: Date.now() };
 }
 
 function publicRoom(room) {
@@ -54,12 +59,20 @@ function publicRoom(room) {
     round: room.round,
     scramble: room.scramble,
     roundWinnerId: room.roundWinnerId,
-    players: room.players.map(({ lastSeen, ...p }) => p),
+    roundEndsAt: room.roundEndsAt,   // epoch ms, null when no round is running
+    roundMs: ROUND_TIME_MS,
+    serverNow: Date.now(),           // lets the app line its countdown up with the server clock
+    players: room.players.map(({ lastSeen, solves, ...p }) => ({
+      ...p,
+      solveCount: solves.length,
+      avgMs: solves.length ? Math.round(solves.reduce((a, b) => a + b, 0) / solves.length) : null,
+    })),
   };
 }
 
 function finishRound(room) {
   room.phase = "results";
+  room.roundEndsAt = null;
   for (const p of room.players) if (p.inRound && p.timeMs == null) p.dnf = true;
   const solved = room.players.filter((p) => p.timeMs != null).sort((a, b) => a.timeMs - b.timeMs);
   if (solved[0]) {
@@ -83,6 +96,17 @@ function removePlayer(room, playerId) {
   checkAllDone(room);
 }
 
+// Time is up: everyone who has not solved is removed from the room.
+function expireRound(room) {
+  if (room.phase !== "round" || !room.roundEndsAt || Date.now() < room.roundEndsAt) return;
+  const late = room.players.filter((p) => p.inRound && p.timeMs == null && !p.dnf);
+  for (const p of late) {
+    kickedPlayers.set(p.id, Date.now() + KICK_MEMORY_MS);
+    removePlayer(room, p.id);
+  }
+  if (rooms.has(room.id) && room.phase === "round") finishRound(room);
+}
+
 function pruneRoom(room) {
   const now = Date.now();
   for (const p of [...room.players]) {
@@ -91,12 +115,24 @@ function pruneRoom(room) {
 }
 
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, code) { super(message); this.status = status; this.code = code; }
+}
+
+function throwIfKicked(playerId) {
+  const until = kickedPlayers.get(playerId);
+  if (until && until > Date.now()) {
+    throw new HttpError(403, "You were removed from the room: you did not finish the solve within 2 minutes.", "KICKED_TIMEOUT");
+  }
 }
 
 function getRoom(source) {
-  const room = rooms.get(String(source.roomId || "").toUpperCase());
-  if (!room) throw new HttpError(404, "Room not found.");
+  const id = String(source.roomId || "").toUpperCase();
+  const room = rooms.get(id);
+  if (room) expireRound(room); // enforce the time limit on every request
+  if (!room || !rooms.has(id)) {
+    throwIfKicked(source.playerId);
+    throw new HttpError(404, "Room not found.");
+  }
   room.lastActive = Date.now();
   return room;
 }
@@ -104,7 +140,10 @@ function getRoom(source) {
 function getMember(source) {
   const room = getRoom(source);
   const player = room.players.find((p) => p.id === source.playerId);
-  if (!player) throw new HttpError(403, "You are not in this room.");
+  if (!player) {
+    throwIfKicked(source.playerId);
+    throw new HttpError(403, "You are not in this room.");
+  }
   player.lastSeen = Date.now();
   return { room, player };
 }
@@ -113,6 +152,7 @@ function getMember(source) {
 const routes = {
   "POST /api/rooms/create": (body) => {
     if (!body.playerId) throw new HttpError(400, "playerId is required.");
+    kickedPlayers.delete(body.playerId);
     const room = {
       id: makeCode(),
       hostId: body.playerId,
@@ -120,6 +160,7 @@ const routes = {
       round: 0,
       scramble: null,
       roundWinnerId: null,
+      roundEndsAt: null,
       players: [newPlayer(body.playerId, body.username)],
       lastActive: Date.now(),
     };
@@ -129,6 +170,7 @@ const routes = {
 
   "POST /api/rooms/join": (body) => {
     if (!body.playerId) throw new HttpError(400, "playerId is required.");
+    kickedPlayers.delete(body.playerId);
     const room = getRoom(body);
     pruneRoom(room);
     if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
@@ -159,6 +201,7 @@ const routes = {
     room.phase = "round";
     room.scramble = makeScramble();
     room.roundWinnerId = null;
+    room.roundEndsAt = Date.now() + ROUND_TIME_MS;
     for (const p of room.players) { p.inRound = true; p.timeMs = null; p.dnf = false; }
     return publicRoom(room);
   },
@@ -171,6 +214,7 @@ const routes = {
     const ms = Math.round(Number(body.timeMs));
     if (!Number.isFinite(ms) || ms < 1 || ms > 60 * 60_000) throw new HttpError(400, "Invalid time.");
     player.timeMs = ms;
+    player.solves.push(ms);
     checkAllDone(room);
     return publicRoom(room);
   },
@@ -221,13 +265,18 @@ const server = http.createServer((req, res) => {
       const query = Object.fromEntries(url.searchParams);
       send(res, 200, handler(body, query));
     } catch (e) {
-      if (e instanceof HttpError) return send(res, e.status, { error: e.message });
+      if (e instanceof HttpError) return send(res, e.status, { error: e.message, code: e.code });
       if (e instanceof SyntaxError) return send(res, 400, { error: "Invalid JSON." });
       console.error(e);
       send(res, 500, { error: "Server error." });
     }
   });
 });
+
+// enforce the round time limit every second
+setInterval(() => {
+  for (const room of [...rooms.values()]) expireRound(room);
+}, 1000).unref();
 
 // clean up dead players / rooms
 setInterval(() => {
@@ -236,6 +285,7 @@ setInterval(() => {
     pruneRoom(room);
     if (rooms.has(room.id) && now - room.lastActive > ROOM_TIMEOUT_MS) rooms.delete(room.id);
   }
+  for (const [id, until] of kickedPlayers) if (until < now) kickedPlayers.delete(id);
 }, 10_000).unref();
 
 server.listen(PORT, () => console.log(`CubePulse battle server listening on ${PORT}`));
