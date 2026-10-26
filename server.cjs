@@ -41,20 +41,9 @@ function makeCode() {
   return code;
 }
 
-function makeScramble(len = 20) {
-  const faces = ["U", "D", "L", "R", "F", "B"];
-  const axis = { U: 0, D: 0, L: 1, R: 1, F: 2, B: 2 };
-  const mods = ["", "'", "2"];
-  const out = [];
-  while (out.length < len) {
-    const f = faces[Math.floor(Math.random() * 6)];
-    const last = out[out.length - 1];
-    const prev = out[out.length - 2];
-    if (last && last.f === f) continue;
-    if (last && prev && axis[last.f] === axis[f] && axis[prev.f] === axis[f]) continue;
-    out.push({ f, m: mods[Math.floor(Math.random() * 3)] });
-  }
-  return out.map((x) => x.f + x.m).join(" ");
+// Every round scramble is a TNoodle-style random-state scramble (see the TNOODLE section at the bottom of this file).
+function makeScramble() {
+  return tnScramble();
 }
 
 function cleanName(n) {
@@ -437,7 +426,7 @@ const routes = {
     return { ok: true };
   },
 
-  "GET /": () => ({ ok: true, service: "cubepulse-battle-server", rooms: rooms.size, features: ["chat", "reactions", "streak"] }),
+  "GET /": () => ({ ok: true, service: "cubepulse-battle-server", rooms: rooms.size, features: ["chat", "reactions", "streak", "tnoodle"] }),
   "GET /health": () => ({ ok: true }),
 };
 
@@ -496,4 +485,408 @@ setInterval(() => {
   for (const [id, until] of kickedPlayers) if (until < now) kickedPlayers.delete(id);
 }, 10_000).unref();
 
-server.listen(PORT, () => console.log(`CubePulse battle server listening on ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`CubePulse battle server listening on ${PORT}`);
+  // Build the scramble tables in the background (about a second). Until they are ready, rounds use random-move scrambles.
+  tnPrepare(() => console.log("TNoodle-style scrambler ready"));
+});
+
+// =====================================================================================================
+// ---------------------------------------------------------------------------
+// TNOODLE-STYLE 3x3 SCRAMBLER
+// Same idea as WCA's TNoodle: pick a UNIFORMLY RANDOM cube state, solve it with
+// Kociemba's two-phase algorithm and use the inverse of the solution as the
+// scramble (so every scramble is ~19-21 moves and every state is equally likely).
+// The lookup tables are built once in small slices (tnPrepare), so the app never
+// freezes. Until they are ready, tnScramble() falls back to a random-move scramble.
+// ---------------------------------------------------------------------------
+var TN_FACES = "URFDLB";
+var TN_URF = 0, TN_UFL = 1, TN_ULB = 2, TN_UBR = 3, TN_DFR = 4, TN_DLF = 5, TN_DBL = 6, TN_DRB = 7;
+var TN_UR = 0, TN_UF = 1, TN_UL = 2, TN_UB = 3, TN_DR = 4, TN_DF = 5, TN_DL = 6, TN_DB = 7, TN_FR = 8, TN_FL = 9, TN_BL = 10, TN_BR = 11;
+var TN_Z12 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+var TN_Z8 = [0, 0, 0, 0, 0, 0, 0, 0];
+
+// the six basic clockwise face turns, order U R F D L B
+var TN_BASE = [
+  { cp: [TN_UBR, TN_URF, TN_UFL, TN_ULB, TN_DFR, TN_DLF, TN_DBL, TN_DRB], co: TN_Z8,
+    ep: [TN_UB, TN_UR, TN_UF, TN_UL, TN_DR, TN_DF, TN_DL, TN_DB, TN_FR, TN_FL, TN_BL, TN_BR], eo: TN_Z12 },
+  { cp: [TN_DFR, TN_UFL, TN_ULB, TN_URF, TN_DRB, TN_DLF, TN_DBL, TN_UBR], co: [2, 0, 0, 1, 1, 0, 0, 2],
+    ep: [TN_FR, TN_UF, TN_UL, TN_UB, TN_BR, TN_DF, TN_DL, TN_DB, TN_DR, TN_FL, TN_BL, TN_UR], eo: TN_Z12 },
+  { cp: [TN_UFL, TN_DLF, TN_ULB, TN_UBR, TN_URF, TN_DFR, TN_DBL, TN_DRB], co: [1, 2, 0, 0, 2, 1, 0, 0],
+    ep: [TN_UR, TN_FL, TN_UL, TN_UB, TN_DR, TN_FR, TN_DL, TN_DB, TN_UF, TN_DF, TN_BL, TN_BR], eo: [0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0] },
+  { cp: [TN_URF, TN_UFL, TN_ULB, TN_UBR, TN_DLF, TN_DBL, TN_DRB, TN_DFR], co: TN_Z8,
+    ep: [TN_UR, TN_UF, TN_UL, TN_UB, TN_DF, TN_DL, TN_DB, TN_DR, TN_FR, TN_FL, TN_BL, TN_BR], eo: TN_Z12 },
+  { cp: [TN_URF, TN_ULB, TN_DBL, TN_UBR, TN_DFR, TN_UFL, TN_DLF, TN_DRB], co: [0, 1, 2, 0, 0, 2, 1, 0],
+    ep: [TN_UR, TN_UF, TN_BL, TN_UB, TN_DR, TN_DF, TN_FL, TN_DB, TN_FR, TN_UL, TN_DL, TN_BR], eo: TN_Z12 },
+  { cp: [TN_URF, TN_UFL, TN_UBR, TN_DRB, TN_DFR, TN_DLF, TN_ULB, TN_DBL], co: [0, 0, 1, 2, 0, 0, 2, 1],
+    ep: [TN_UR, TN_UF, TN_UL, TN_BR, TN_DR, TN_DF, TN_DL, TN_BL, TN_FR, TN_FL, TN_UB, TN_DB], eo: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1] },
+];
+
+function tnNewCube() {
+  return { cp: [0, 1, 2, 3, 4, 5, 6, 7], co: [0, 0, 0, 0, 0, 0, 0, 0], ep: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+}
+// out = a, then b   (out must not be a or b)
+function tnMul(a, b, out) {
+  for (var c = 0; c < 8; c++) {
+    var bc = b.cp[c];
+    out.cp[c] = a.cp[bc];
+    out.co[c] = (a.co[bc] + b.co[c]) % 3;
+  }
+  for (var e = 0; e < 12; e++) {
+    var be = b.ep[e];
+    out.ep[e] = a.ep[be];
+    out.eo[e] = (a.eo[be] + b.eo[e]) & 1;
+  }
+}
+function tnCopy(a, out) {
+  for (var i = 0; i < 8; i++) { out.cp[i] = a.cp[i]; out.co[i] = a.co[i]; }
+  for (var j = 0; j < 12; j++) { out.ep[j] = a.ep[j]; out.eo[j] = a.eo[j]; }
+}
+
+// 18 moves: index = face * 3 + k   (k: 0 = X, 1 = X2, 2 = X')
+var TN_MOVE = [];
+(function () {
+  for (var f = 0; f < 6; f++) {
+    var cur = TN_BASE[f];
+    for (var k = 0; k < 3; k++) {
+      TN_MOVE.push(cur);
+      var nxt = tnNewCube();
+      tnMul(cur, TN_BASE[f], nxt);
+      cur = nxt;
+    }
+  }
+})();
+// phase 2 only turns U, D freely and R, L, F, B by half turns
+var TN_P2 = [0, 1, 2, 9, 10, 11, 4, 13, 7, 16]; // U U2 U-prime, D D2 D-prime, R2 L2 F2 B2
+var TN_IS_P2 = (function () { var a = []; for (var i = 0; i < 18; i++) a.push(false); for (var j = 0; j < TN_P2.length; j++) a[TN_P2[j]] = true; return a; })();
+
+// ---- coordinates ----
+function tnRank(a, n, off) {
+  var r = 0;
+  for (var i = 0; i < n - 1; i++) {
+    var c = 0;
+    for (var j = i + 1; j < n; j++) if (a[off + j] < a[off + i]) c++;
+    r = r * (n - i) + c;
+  }
+  return r;
+}
+function tnUnrank(r, n, out, off, add) {
+  var c = [];
+  for (var i = n - 2; i >= 0; i--) { var base = n - i; c[i] = r % base; r = (r / base) | 0; }
+  var avail = [];
+  for (var k = 0; k < n; k++) avail.push(k);
+  for (var m = 0; m < n - 1; m++) out[off + m] = avail.splice(c[m], 1)[0] + add;
+  out[off + n - 1] = avail[0] + add;
+}
+var TN_SLICE_N = 495;
+var TN_SLICE_SETS = []; // slice index -> the 4 positions the slice edges sit in
+var TN_MASK_TO_SLICE = new Int16Array(4096).fill(-1);
+(function () {
+  // the solved set (positions 8..11) is index 0
+  TN_SLICE_SETS.push([8, 9, 10, 11]);
+  TN_MASK_TO_SLICE[0xF00] = 0;
+  for (var a = 0; a < 12; a++) for (var b = a + 1; b < 12; b++) for (var c = b + 1; c < 12; c++) for (var d = c + 1; d < 12; d++) {
+    var mask = (1 << a) | (1 << b) | (1 << c) | (1 << d);
+    if (mask === 0xF00) continue;
+    TN_MASK_TO_SLICE[mask] = TN_SLICE_SETS.length;
+    TN_SLICE_SETS.push([a, b, c, d]);
+  }
+})();
+function tnGetTwist(c) { var t = 0; for (var i = 0; i < 7; i++) t = t * 3 + c.co[i]; return t; }
+function tnGetFlip(c) { var f = 0; for (var i = 0; i < 11; i++) f = f * 2 + c.eo[i]; return f; }
+function tnGetSlice(c) { var m = 0; for (var i = 0; i < 12; i++) if (c.ep[i] >= 8) m |= 1 << i; return TN_MASK_TO_SLICE[m]; }
+function tnSetTwist(c, t) { var s = 0; for (var i = 6; i >= 0; i--) { c.co[i] = t % 3; s += c.co[i]; t = (t / 3) | 0; } c.co[7] = (3 - (s % 3)) % 3; }
+function tnSetFlip(c, f) { var s = 0; for (var i = 10; i >= 0; i--) { c.eo[i] = f & 1; s += c.eo[i]; f >>= 1; } c.eo[11] = s & 1; }
+function tnSetSlice(c, idx) {
+  var set = TN_SLICE_SETS[idx], inSet = [], i, nextSlice = 8, nextOther = 0;
+  for (i = 0; i < 12; i++) inSet.push(false);
+  for (i = 0; i < 4; i++) inSet[set[i]] = true;
+  for (i = 0; i < 12; i++) c.ep[i] = inSet[i] ? nextSlice++ : nextOther++;
+}
+
+// ---- tables (built in slices by tnPrepare) ----
+var TN_READY = false;
+var TN_STARTED = false;
+var tnTwistMove, tnFlipMove, tnSliceMove, tnCpMove, tnEpMove, tnSpMove;
+var tnPruneTS, tnPruneFS, tnPruneCS, tnPruneES;
+
+function tnMoveTable(n, moveList, setter, getter) {
+  var table = new Uint16Array(n * 18);
+  var base = tnNewCube(), out = tnNewCube();
+  for (var i = 0; i < n; i++) {
+    base = tnNewCube();
+    setter(base, i);
+    for (var mi = 0; mi < moveList.length; mi++) {
+      var m = moveList[mi];
+      tnMul(base, TN_MOVE[m], out);
+      table[i * 18 + m] = getter(out);
+    }
+  }
+  return table;
+}
+var TN_ALL = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+
+// breadth-first pruning table over (coordA, coordB), one depth level per call; true when finished
+function tnPruneJob(sizeA, sizeB, moveA, moveB, moves, assign) {
+  var total = sizeA * sizeB;
+  var table = new Uint8Array(total).fill(255);
+  table[0] = 0;
+  var filled = 1, depth = 0;
+  assign(table);
+  return function () {
+    var nm = moves.length;
+    for (var idx = 0; idx < total; idx++) {
+      if (table[idx] !== depth) continue;
+      var a = (idx / sizeB) | 0, b = idx - a * sizeB;
+      for (var mi = 0; mi < nm; mi++) {
+        var m = moves[mi];
+        var ni = moveA[a * 18 + m] * sizeB + moveB[b * 18 + m];
+        if (table[ni] === 255) { table[ni] = depth + 1; filled++; }
+      }
+    }
+    depth++;
+    return filled >= total;
+  };
+}
+
+function tnBuildJobs() {
+  var jobs = [];
+  var P2 = TN_P2;
+  jobs.push(function () { tnTwistMove = tnMoveTable(2187, TN_ALL, tnSetTwist, tnGetTwist); return true; });
+  jobs.push(function () { tnFlipMove = tnMoveTable(2048, TN_ALL, tnSetFlip, tnGetFlip); return true; });
+  jobs.push(function () { tnSliceMove = tnMoveTable(TN_SLICE_N, TN_ALL, tnSetSlice, tnGetSlice); return true; });
+  jobs.push(function () {
+    tnCpMove = tnMoveTable(40320, P2, function (c, r) { tnUnrank(r, 8, c.cp, 0, 0); }, function (c) { return tnRank(c.cp, 8, 0); });
+    return true;
+  });
+  jobs.push(function () {
+    tnEpMove = tnMoveTable(40320, P2, function (c, r) { tnUnrank(r, 8, c.ep, 0, 0); }, function (c) { return tnRank(c.ep, 8, 0); });
+    return true;
+  });
+  jobs.push(function () {
+    tnSpMove = tnMoveTable(24, P2, function (c, r) { tnUnrank(r, 4, c.ep, 8, 8); }, function (c) { return tnRank(c.ep, 4, 8); });
+    return true;
+  });
+  var made = {};
+  function lazyJob(key, make) {
+    jobs.push(function () {
+      if (!made[key]) made[key] = make();
+      return made[key]();
+    });
+  }
+  // phase 1: (twist, slice) and (flip, slice).  Goal = (0, slice 0).
+  lazyJob("ts", function () { return tnPruneJob(2187, TN_SLICE_N, tnTwistMove, tnSliceMove, TN_ALL, function (t) { tnPruneTS = t; }); });
+  lazyJob("fs", function () { return tnPruneJob(2048, TN_SLICE_N, tnFlipMove, tnSliceMove, TN_ALL, function (t) { tnPruneFS = t; }); });
+  // phase 2: (corner perm, slice perm) and (UD edge perm, slice perm).  Goal = (0, 0).
+  lazyJob("cs", function () { return tnPruneJob(40320, 24, tnCpMove, tnSpMove, P2, function (t) { tnPruneCS = t; }); });
+  lazyJob("es", function () { return tnPruneJob(40320, 24, tnEpMove, tnSpMove, P2, function (t) { tnPruneES = t; }); });
+  return jobs;
+}
+
+var tnJobs = null;
+function tnStep() {
+  if (TN_READY) return true;
+  if (!tnJobs) tnJobs = tnBuildJobs();
+  if (tnJobs[0]()) tnJobs.shift();
+  if (tnJobs.length === 0) { TN_READY = true; return true; }
+  return false;
+}
+// Build every table right now (server start-up, tests).
+function tnPrepareSync() { while (!tnStep()) { /* keep going */ } }
+// Build the tables in small slices so the UI never freezes. onReady is optional.
+function tnPrepare(onReady) {
+  if (TN_READY) { if (onReady) onReady(); return; }
+  if (TN_STARTED) { if (onReady) tnWaiters.push(onReady); return; }
+  TN_STARTED = true;
+  if (onReady) tnWaiters.push(onReady);
+  var tick = function () {
+    var t0 = Date.now(), done = false;
+    while (!done && Date.now() - t0 < 12) done = tnStep();
+    if (done) { tnPrefill(3); var w = tnWaiters; tnWaiters = []; for (var i = 0; i < w.length; i++) { try { w[i](); } catch (e) { /* ignore */ } } }
+    else setTimeout(tick, 0);
+  };
+  setTimeout(tick, 0);
+}
+var tnWaiters = [];
+function tnIsReady() { return TN_READY; }
+
+// ---- the solver ----
+function tnSolve(cube, maxTotal, targetLen, budgetMs, nodeCap) {
+  var t0 = tnGetTwist(cube), f0 = tnGetFlip(cube), s0 = tnGetSlice(cube);
+  var path = new Int8Array(48), path2 = new Int8Array(48);
+  var best = null, aborted = false, nodes = 0;
+  var deadline = Date.now() + budgetMs;
+  var scratchA = tnNewCube(), scratchB = tnNewCube();
+
+  function p2(c, e, s, rem, lastFace, depth) {
+    if (rem === 0) return c === 0 && e === 0 && s === 0;
+    var h = tnPruneCS[c * 24 + s], h2 = tnPruneES[e * 24 + s];
+    if (h2 > h) h = h2;
+    if (h > rem) return false;
+    for (var i = 0; i < 10; i++) {
+      var m = TN_P2[i], face = (m / 3) | 0;
+      if (lastFace >= 0 && (face === lastFace || (face % 3 === lastFace % 3 && face < lastFace))) continue;
+      path2[depth] = m;
+      if (p2(tnCpMove[c * 18 + m], tnEpMove[e * 18 + m], tnSpMove[s * 18 + m], rem - 1, face, depth + 1)) return true;
+    }
+    return false;
+  }
+
+  function tryP2(d1) {
+    // apply the phase-1 moves to get the phase-2 coordinates
+    tnCopy(cube, scratchA);
+    for (var i = 0; i < d1; i++) { tnMul(scratchA, TN_MOVE[path[i]], scratchB); var t = scratchA; scratchA = scratchB; scratchB = t; }
+    var c = tnRank(scratchA.cp, 8, 0), e = tnRank(scratchA.ep, 8, 0), s = tnRank(scratchA.ep, 4, 8);
+    var r2 = maxTotal - d1;
+    if (r2 < 0) return false;
+    var h = tnPruneCS[c * 24 + s], h2 = tnPruneES[e * 24 + s];
+    if (h2 > h) h = h2;
+    if (h > r2) return false;
+    var lastFace = d1 > 0 ? ((path[d1 - 1] / 3) | 0) : -1;
+    for (var lim = h; lim <= r2; lim++) {
+      if (p2(c, e, s, lim, lastFace, 0)) {
+        var sol = [];
+        for (var a = 0; a < d1; a++) sol.push(path[a]);
+        for (var b = 0; b < lim; b++) sol.push(path2[b]);
+        best = sol;
+        maxTotal = sol.length - 1;
+        return sol.length <= targetLen;
+      }
+    }
+    return false;
+  }
+
+  function p1(t, f, s, rem, last, depth) {
+    if (rem === 0) {
+      if (t === 0 && f === 0 && s === 0) {
+        if (last >= 0 && TN_IS_P2[last]) return false;
+        return tryP2(depth);
+      }
+      return false;
+    }
+    if (((++nodes) & 8191) === 0) {
+      if (best && Date.now() > deadline) { aborted = true; return true; }
+      if (nodeCap && nodes > nodeCap) { aborted = true; return true; }
+    }
+    var h = tnPruneTS[t * TN_SLICE_N + s], h2 = tnPruneFS[f * TN_SLICE_N + s];
+    if (h2 > h) h = h2;
+    if (h > rem) return false;
+    var lf = last >= 0 ? ((last / 3) | 0) : -1;
+    for (var m = 0; m < 18; m++) {
+      var face = (m / 3) | 0;
+      if (lf >= 0 && (face === lf || (face % 3 === lf % 3 && face < lf))) continue;
+      path[depth] = m;
+      if (p1(tnTwistMove[t * 18 + m], tnFlipMove[f * 18 + m], tnSliceMove[s * 18 + m], rem - 1, m, depth + 1)) return true;
+      if (aborted) return true;
+    }
+    return false;
+  }
+
+  for (var d1 = 0; d1 <= maxTotal; d1++) {
+    if (p1(t0, f0, s0, d1, -1, 0)) break;
+  }
+  return best;
+}
+
+// ---- random state + scramble text ----
+function tnRand(n) {
+  try {
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      var buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      return buf[0] % n;
+    }
+  } catch (e) { /* use Math.random */ }
+  return Math.floor(Math.random() * n);
+}
+function tnShuffle(n) {
+  var a = [], i;
+  for (i = 0; i < n; i++) a.push(i);
+  for (i = n - 1; i > 0; i--) { var j = tnRand(i + 1), t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+function tnParity(a) { var p = 0; for (var i = 0; i < a.length; i++) for (var j = i + 1; j < a.length; j++) if (a[i] > a[j]) p ^= 1; return p; }
+function tnRandomCube() {
+  var c = tnNewCube(), i, s;
+  c.cp = tnShuffle(8);
+  c.ep = tnShuffle(12);
+  if (tnParity(c.cp) !== tnParity(c.ep)) { var t = c.ep[0]; c.ep[0] = c.ep[1]; c.ep[1] = t; }
+  s = 0;
+  for (i = 0; i < 7; i++) { c.co[i] = tnRand(3); s += c.co[i]; }
+  c.co[7] = (3 - (s % 3)) % 3;
+  s = 0;
+  for (i = 0; i < 11; i++) { c.eo[i] = tnRand(2); s += c.eo[i]; }
+  c.eo[11] = s & 1;
+  return c;
+}
+// the scramble is the inverse of the solution
+function tnMovesToScramble(sol) {
+  var out = [];
+  for (var i = sol.length - 1; i >= 0; i--) {
+    var face = (sol[i] / 3) | 0, k = sol[i] % 3;
+    out.push(TN_FACES[face] + (k === 0 ? "'" : k === 1 ? "2" : ""));
+  }
+  return out.join(" ");
+}
+// old style random-move scramble, only used while the tables are still being built
+function tnFallbackScramble(len) {
+  len = len || 20;
+  var axis = [0, 1, 2, 0, 1, 2], mods = ["", "'", "2"], out = [], last = -1, prev = -1;
+  while (out.length < len) {
+    var f = tnRand(6);
+    if (f === last) continue;
+    if (last >= 0 && prev >= 0 && axis[last] === axis[f] && axis[prev] === axis[f]) continue;
+    out.push(TN_FACES[f] + mods[tnRand(3)]);
+    prev = last; last = f;
+  }
+  return out.join(" ");
+}
+// inverse of a cube state: solving the inverse gives a sequence that, applied to a solved cube, makes the state itself
+function tnInvert(c) {
+  var r = tnNewCube(), i;
+  for (i = 0; i < 8; i++) { r.cp[c.cp[i]] = i; r.co[c.cp[i]] = (3 - c.co[i]) % 3; }
+  for (i = 0; i < 12; i++) { r.ep[c.ep[i]] = i; r.eo[c.ep[i]] = c.eo[i]; }
+  return r;
+}
+function tnMovesToText(sol) {
+  var out = [];
+  for (var i = 0; i < sol.length; i++) out.push(TN_FACES[(sol[i] / 3) | 0] + ["", "2", "'"][sol[i] % 3]);
+  return out.join(" ");
+}
+// Staged search: first try for 21 moves or less (on the cube and on its inverse), then 22, 23 ...
+// (like TNoodle, almost always 19-21 moves). Returns the scramble text.
+function tnScrambleForCube(cube) {
+  var inv = tnInvert(cube), stages = [[21, 250000], [22, 400000], [23, 800000]];
+  for (var i = 0; i < stages.length; i++) {
+    var sol = tnSolve(cube, stages[i][0], stages[i][0], 1e9, stages[i][1]);
+    if (sol) return { text: tnMovesToScramble(sol), len: sol.length };
+    sol = tnSolve(inv, stages[i][0], stages[i][0], 1e9, stages[i][1]);
+    if (sol) return { text: tnMovesToText(sol), len: sol.length };
+  }
+  var last = tnSolve(cube, 30, 30, 1e9, 0); // always finds something
+  return { text: tnMovesToScramble(last), len: last.length };
+}
+function tnScrambleNow() {
+  for (var tries = 0; tries < 5; tries++) {
+    var r = tnScrambleForCube(tnRandomCube());
+    if (r.len >= 5) return r.text;
+  }
+  return tnFallbackScramble(20);
+}
+// A few scrambles are made ahead of time (one at a time, between other work), so asking for one is instant.
+var tnPool = [], tnPoolTimer = null;
+function tnPrefill(n) {
+  if (!TN_READY || tnPool.length >= n || tnPoolTimer) return;
+  tnPoolTimer = setTimeout(function () {
+    tnPoolTimer = null;
+    if (tnPool.length < n) tnPool.push(tnScrambleNow());
+    tnPrefill(n);
+  }, 60);
+}
+// A WCA / TNoodle style 3x3 scramble. Falls back to random moves only until the tables are ready.
+function tnScramble() {
+  if (!TN_READY) { tnPrepare(); return tnFallbackScramble(20); }
+  var s = tnPool.length ? tnPool.shift() : tnScrambleNow();
+  tnPrefill(3);
+  return s;
+}
