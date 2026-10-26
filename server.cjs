@@ -60,7 +60,7 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now(), lastChatAt: 0, lastReactAt: 0 };
+  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now(), lastChatAt: 0, lastReactAt: 0, streak: 0, prevStreak: 0 };
 }
 
 // opts.chatSince / opts.reactSince = the last chat / reaction id the client already has.
@@ -85,7 +85,7 @@ function publicRoom(room, opts = {}) {
     reactSeq: room.reactSeq,
     chat: chatSince === null ? [] : room.chat.filter((m) => m.id > chatSince),
     reactions: reactSince === null ? [] : room.reactions.filter((x) => x.id > reactSince && now - x.at < REACTION_KEEP_MS),
-    players: room.players.map(({ lastSeen, solves, counted, lastChatAt, lastReactAt, ...p }) => ({
+    players: room.players.map(({ lastSeen, solves, counted, lastChatAt, lastReactAt, prevStreak, ...p }) => ({
       ...p,
       offline: now - lastSeen > OFFLINE_AFTER_MS,
       solveCount: solves.length,
@@ -117,6 +117,9 @@ function awardWinner(room) {
   } else {
     room.roundWinnerId = null;
   }
+  // Win streak = rounds won in a row. Everyone who played this round and did not win goes back to 0.
+  // prevStreak is the streak from before this round, so changing a penalty (re-awarding) never counts twice.
+  for (const p of room.players) if (p.inRound) p.streak = p.id === room.roundWinnerId ? p.prevStreak + 1 : 0;
 }
 
 function startRound(room) {
@@ -127,7 +130,7 @@ function startRound(room) {
   room.roundEndsAt = null; // no round time limit anymore: nobody is kicked for being slow
   room.nextRoundAt = null;
   // Everyone starts as "idle" (shown as STAY) until they hold the timer (INSPECTING) or start solving (SOLVING).
-  for (const p of room.players) { p.inRound = true; p.status = "idle"; p.timeMs = null; p.dnf = false; p.rawMs = null; p.penalty = "none"; p.counted = false; }
+  for (const p of room.players) { p.prevStreak = p.streak; p.inRound = true; p.status = "idle"; p.timeMs = null; p.dnf = false; p.rawMs = null; p.penalty = "none"; p.counted = false; }
 }
 
 // Everyone finished and the short pause is over: new scramble, same room.
