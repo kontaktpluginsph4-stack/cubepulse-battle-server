@@ -18,6 +18,13 @@ const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player
 const PLAYER_TIMEOUT_MS = Number(process.env.PLAYER_TIMEOUT_MS) || 90_000; // no polling for 90s -> removed from the room. Short wifi drops / app switches stay in the room.
 const OFFLINE_AFTER_MS = 8_000;          // no polling for 8s -> shown as RECONNECTING to the others (not removed yet)
 const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
+// Chat + emoji reactions
+const CHAT_KEEP = 60;                 // last N chat messages kept per room
+const CHAT_MAX_LEN = 200;             // max characters per message
+const CHAT_GAP_MS = 400;              // min time between two messages from the same player (anti-spam)
+const REACTION_EMOJIS = ["🔥", "😭", "👏"];
+const REACTION_GAP_MS = 150;          // min time between two reactions from the same player
+const REACTION_KEEP_MS = 10_000;      // reactions are short-lived: only the last 10s are kept
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
 
 const rooms = new Map();
@@ -53,10 +60,15 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now() };
+  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now(), lastChatAt: 0, lastReactAt: 0 };
 }
 
-function publicRoom(room) {
+// opts.chatSince / opts.reactSince = the last chat / reaction id the client already has.
+// Only newer items are sent (so polling stays tiny). Left out = nothing is sent for that part.
+function publicRoom(room, opts = {}) {
+  const now = Date.now();
+  const chatSince = Number.isFinite(opts.chatSince) ? opts.chatSince : null;
+  const reactSince = Number.isFinite(opts.reactSince) ? opts.reactSince : null;
   return {
     id: room.id,
     hostId: room.hostId,
@@ -68,10 +80,14 @@ function publicRoom(room) {
     roundEndsAt: room.roundEndsAt,   // epoch ms, null when no round is running
     nextRoundAt: room.nextRoundAt,   // epoch ms of the automatic next scramble, null if the host has to start it
     roundMs: ROUND_TIME_MS,
-    serverNow: Date.now(),           // lets the app line its countdown up with the server clock
-    players: room.players.map(({ lastSeen, solves, counted, ...p }) => ({
+    serverNow: now,                  // lets the app line its countdown up with the server clock
+    chatSeq: room.chatSeq,           // id of the newest chat message / reaction (0 = none yet)
+    reactSeq: room.reactSeq,
+    chat: chatSince === null ? [] : room.chat.filter((m) => m.id > chatSince),
+    reactions: reactSince === null ? [] : room.reactions.filter((x) => x.id > reactSince && now - x.at < REACTION_KEEP_MS),
+    players: room.players.map(({ lastSeen, solves, counted, lastChatAt, lastReactAt, ...p }) => ({
       ...p,
-      offline: Date.now() - lastSeen > OFFLINE_AFTER_MS,
+      offline: now - lastSeen > OFFLINE_AFTER_MS,
       solveCount: solves.length,
       avgMs: solves.length ? Math.round(solves.reduce((a, b) => a + b, 0) / solves.length) : null,
     })),
@@ -196,10 +212,12 @@ const routes = {
       roundEndsAt: null,
       nextRoundAt: null,
       players: [newPlayer(body.playerId, body.username)],
+      chat: [], chatSeq: 0,
+      reactions: [], reactSeq: 0,
       lastActive: Date.now(),
     };
     rooms.set(room.id, room);
-    return publicRoom(room);
+    return publicRoom(room, { chatSince: 0 });
   },
 
   "POST /api/rooms/join": (body) => {
@@ -213,18 +231,22 @@ const routes = {
     if (existing) {
       existing.lastSeen = Date.now();
       existing.username = cleanName(body.username);
-      return publicRoom(room);
+      return publicRoom(room, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
     }
     if (room.players.length >= MAX_PLAYERS) throw new HttpError(409, `Room is full (${MAX_PLAYERS}/${MAX_PLAYERS}).`);
     room.players.push(newPlayer(body.playerId, body.username)); // joins mid-round -> spectates until next round
-    return publicRoom(room);
+    return publicRoom(room, { chatSince: 0 }); // a new player gets the recent chat history
   },
 
   "GET /api/rooms/state": (_body, query) => {
     const { room } = getMember(query);
     pruneRoom(room);
     if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
-    return publicRoom(room);
+    // chatSince / reactSince are optional: old app versions that do not send them just get no chat / reactions.
+    return publicRoom(room, {
+      chatSince: query.chatSince !== undefined ? Number(query.chatSince) : undefined,
+      reactSince: query.reactSince !== undefined ? Number(query.reactSince) : undefined,
+    });
   },
 
   "POST /api/rooms/start": (body) => {
@@ -299,6 +321,34 @@ const routes = {
     if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can end the round.");
     if (room.phase === "round") finishRound(room, false); // host ended it: the host starts the next one
     return publicRoom(room);
+  },
+
+  // Emoji reaction: flies over the row of `targetId` on everyone's screen.
+  "POST /api/rooms/react": (body) => {
+    const { room, player } = getMember(body);
+    const view = () => publicRoom(room, { chatSince: Number(body.chatSince), reactSince: Number(body.reactSince) });
+    if (!REACTION_EMOJIS.includes(body.emoji)) throw new HttpError(400, "Invalid emoji.");
+    if (!room.players.some((p) => p.id === body.targetId)) throw new HttpError(404, "That player is not in the room.");
+    const now = Date.now();
+    if (now - player.lastReactAt < REACTION_GAP_MS) return view(); // too fast: silently ignored
+    player.lastReactAt = now;
+    room.reactions.push({ id: ++room.reactSeq, fromId: player.id, targetId: body.targetId, emoji: body.emoji, at: now });
+    room.reactions = room.reactions.filter((x) => now - x.at < REACTION_KEEP_MS).slice(-100);
+    return view();
+  },
+
+  // Chat message (text only, max 200 chars, last 60 kept).
+  "POST /api/rooms/chat": (body) => {
+    const { room, player } = getMember(body);
+    const view = () => publicRoom(room, { chatSince: Number(body.chatSince), reactSince: Number(body.reactSince) });
+    const text = String(body.text ?? "").replace(/[\u0000-\u001F\u007F]+/g, " ").replace(/\s+/g, " ").trim().slice(0, CHAT_MAX_LEN);
+    if (!text) return view();
+    const now = Date.now();
+    if (now - player.lastChatAt < CHAT_GAP_MS) return view(); // too fast: silently ignored
+    player.lastChatAt = now;
+    room.chat.push({ id: ++room.chatSeq, playerId: player.id, username: player.username, text, at: now });
+    if (room.chat.length > CHAT_KEEP) room.chat = room.chat.slice(-CHAT_KEEP);
+    return view();
   },
 
   "POST /api/rooms/leave": (body) => {
