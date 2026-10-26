@@ -15,7 +15,8 @@ const NEXT_ROUND_DELAY_MS = process.env.NEXT_ROUND_DELAY_MS !== undefined && pro
   ? Math.max(0, Number(process.env.NEXT_ROUND_DELAY_MS) || 0)
   : 3000;
 const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player can be told why
-const PLAYER_TIMEOUT_MS = 20_000;      // no polling for 20s -> removed from the room (tab switches keep polling, so players stay in the room)
+const PLAYER_TIMEOUT_MS = Number(process.env.PLAYER_TIMEOUT_MS) || 90_000; // no polling for 90s -> removed from the room. Short wifi drops / app switches stay in the room.
+const OFFLINE_AFTER_MS = 8_000;          // no polling for 8s -> shown as RECONNECTING to the others (not removed yet)
 const ROOM_TIMEOUT_MS = 30 * 60_000;   // idle rooms are deleted after 30 min
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
 
@@ -52,7 +53,7 @@ function cleanName(n) {
 }
 
 function newPlayer(id, username) {
-  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now() };
+  return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now() };
 }
 
 function publicRoom(room) {
@@ -68,8 +69,9 @@ function publicRoom(room) {
     nextRoundAt: room.nextRoundAt,   // epoch ms of the automatic next scramble, null if the host has to start it
     roundMs: ROUND_TIME_MS,
     serverNow: Date.now(),           // lets the app line its countdown up with the server clock
-    players: room.players.map(({ lastSeen, solves, ...p }) => ({
+    players: room.players.map(({ lastSeen, solves, counted, ...p }) => ({
       ...p,
+      offline: Date.now() - lastSeen > OFFLINE_AFTER_MS,
       solveCount: solves.length,
       avgMs: solves.length ? Math.round(solves.reduce((a, b) => a + b, 0) / solves.length) : null,
     })),
@@ -83,6 +85,15 @@ function finishRound(room, auto = true) {
   room.roundEndsAt = null;
   room.nextRoundAt = auto ? Date.now() + NEXT_ROUND_DELAY_MS : null;
   for (const p of room.players) if (p.inRound && p.timeMs == null) { p.dnf = true; p.lastMs = null; p.lastDnf = true; }
+  awardWinner(room);
+}
+
+// Gives the round win to the fastest valid time. Safe to call again when a penalty changes the result.
+function awardWinner(room) {
+  if (room.roundWinnerId) {
+    const prev = room.players.find((p) => p.id === room.roundWinnerId);
+    if (prev && prev.wins > 0) prev.wins -= 1;
+  }
   const solved = room.players.filter((p) => p.timeMs != null).sort((a, b) => a.timeMs - b.timeMs);
   if (solved[0]) {
     solved[0].wins += 1;
@@ -100,7 +111,7 @@ function startRound(room) {
   room.roundEndsAt = null; // no round time limit anymore: nobody is kicked for being slow
   room.nextRoundAt = null;
   // Everyone starts as "idle" (shown as STAY) until they hold the timer (INSPECTING) or start solving (SOLVING).
-  for (const p of room.players) { p.inRound = true; p.status = "idle"; p.timeMs = null; p.dnf = false; }
+  for (const p of room.players) { p.inRound = true; p.status = "idle"; p.timeMs = null; p.dnf = false; p.rawMs = null; p.penalty = "none"; p.counted = false; }
 }
 
 // Everyone finished and the short pause is over: new scramble, same room.
@@ -245,11 +256,41 @@ const routes = {
     const ms = Math.round(Number(body.timeMs));
     if (!Number.isFinite(ms) || ms < 1 || ms > 60 * 60_000) throw new HttpError(400, "Invalid time.");
     player.timeMs = ms;
+    player.rawMs = ms;       // the time on the timer, before any +2
+    player.penalty = "none";
     player.lastMs = ms;      // shown above "STAY" in the players panel during the next round
     player.lastDnf = false;
     player.status = "done";
     player.solves.push(ms);
+    player.counted = true;
     checkAllDone(room);
+    return publicRoom(room);
+  },
+
+  // +2 / DNF on your own solve of the current round. penalty: "+2" | "dnf" | "none" (tapping it again removes it).
+  "POST /api/rooms/penalty": (body) => {
+    const { room, player } = getMember(body);
+    if (room.phase !== "round" && room.phase !== "results") throw new HttpError(409, "No solve to change.");
+    if (!player.inRound || player.rawMs == null) throw new HttpError(409, "No solve to change.");
+    const pen = body.penalty === "+2" || body.penalty === "dnf" ? body.penalty : "none";
+    if (player.counted) { player.solves.pop(); player.counted = false; } // the average uses the corrected time
+    player.penalty = pen;
+    if (pen === "dnf") {
+      player.timeMs = null;
+      player.dnf = true;
+      player.lastMs = null;
+      player.lastDnf = true;
+    } else {
+      const ms = player.rawMs + (pen === "+2" ? 2000 : 0);
+      player.timeMs = ms;
+      player.dnf = false;
+      player.lastMs = ms;
+      player.lastDnf = false;
+      player.solves.push(ms);
+      player.counted = true;
+    }
+    player.status = "done";
+    if (room.phase === "results") awardWinner(room); else checkAllDone(room);
     return publicRoom(room);
   },
 
