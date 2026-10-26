@@ -54,6 +54,15 @@ function newPlayer(id, username) {
   return { id, username: cleanName(username), inRound: false, status: "idle", timeMs: null, dnf: false, rawMs: null, penalty: "none", counted: false, lastMs: null, lastDnf: false, wins: 0, solves: [], lastSeen: Date.now(), lastChatAt: 0, lastReactAt: 0, streak: 0, prevStreak: 0 };
 }
 
+// Join answers: { pending: true } means "still waiting for the host". The full room view also has a
+// "pending" LIST (the host's join requests), which older app builds mistake for "still waiting".
+// A joiner who is already in is never the one answering requests here, so drop the list from these answers.
+function joinedView(room, playerId, opts) {
+  const view = publicRoom(room, opts);
+  if (room.hostId !== playerId) delete view.pending;
+  return view;
+}
+
 // opts.chatSince / opts.reactSince = the last chat / reaction id the client already has.
 // Only newer items are sent (so polling stays tiny). Left out = nothing is sent for that part.
 function publicRoom(room, opts = {}) {
@@ -243,7 +252,7 @@ const routes = {
     if (existing) {
       existing.lastSeen = Date.now();
       existing.username = cleanName(body.username);
-      return publicRoom(room, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
+      return joinedView(room, body.playerId, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
     }
     if (room.players.length >= MAX_PLAYERS) throw new HttpError(409, `Room is full (${MAX_PLAYERS}/${MAX_PLAYERS}).`);
 
@@ -257,7 +266,7 @@ const routes = {
       return { pending: true, roomId: room.id };
     }
     room.players.push(newPlayer(body.playerId, body.username)); // joins mid-round -> spectates until next round
-    return publicRoom(room, { chatSince: 0 }); // a new player gets the recent chat history
+    return joinedView(room, body.playerId, { chatSince: 0 }); // a new player gets the recent chat history
   },
 
   // The player who asked to join polls this: still waiting / approved (full room) / declined (403 DECLINED).
@@ -269,7 +278,7 @@ const routes = {
     if (room.players.some((p) => p.id === query.playerId)) {
       const me = room.players.find((p) => p.id === query.playerId);
       me.lastSeen = Date.now();
-      return publicRoom(room, { chatSince: 0 });
+      return joinedView(room, query.playerId, { chatSince: 0 });
     }
     const q = room.pending.find((x) => x.id === query.playerId);
     if (q) { q.lastSeen = Date.now(); return { pending: true, roomId: room.id }; }
