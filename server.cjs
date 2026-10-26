@@ -14,6 +14,8 @@ const ROUND_TIME_MS = Number(process.env.ROUND_TIME_MS) || 2 * 60_000;
 const NEXT_ROUND_DELAY_MS = process.env.NEXT_ROUND_DELAY_MS !== undefined && process.env.NEXT_ROUND_DELAY_MS !== ""
   ? Math.max(0, Number(process.env.NEXT_ROUND_DELAY_MS) || 0)
   : 3000;
+const JOIN_REQUEST_TTL_MS = 20_000;  // a join request disappears if the player stops waiting (no status polling)
+const DECLINE_MEMORY_MS = 15_000;    // how long a decline is remembered so the player can be told
 const KICK_MEMORY_MS = 10 * 60_000; // how long we remember a kick so the player can be told why
 const PLAYER_TIMEOUT_MS = Number(process.env.PLAYER_TIMEOUT_MS) || 90_000; // no polling for 90s -> removed from the room. Short wifi drops / app switches stay in the room.
 const OFFLINE_AFTER_MS = 8_000;          // no polling for 8s -> shown as RECONNECTING to the others (not removed yet)
@@ -78,6 +80,7 @@ function publicRoom(room, opts = {}) {
     scramble: room.scramble,
     roundWinnerId: room.roundWinnerId,
     roundEndsAt: room.roundEndsAt,   // epoch ms, null when no round is running
+    pending: (room.pending || []).map(({ id, username }) => ({ id, username })), // join requests waiting for the host
     nextRoundAt: room.nextRoundAt,   // epoch ms of the automatic next scramble, null if the host has to start it
     roundMs: ROUND_TIME_MS,
     serverNow: now,                  // lets the app line its countdown up with the server clock
@@ -160,6 +163,8 @@ function expireRound(_room) {}
 
 function pruneRoom(room) {
   const now = Date.now();
+  if (room.pending) room.pending = room.pending.filter((q) => now - q.lastSeen < JOIN_REQUEST_TTL_MS);
+  if (room.declined) for (const [id, until] of room.declined) if (until < now) room.declined.delete(id);
   for (const p of [...room.players]) {
     if (now - p.lastSeen > PLAYER_TIMEOUT_MS) removePlayer(room, p.id);
   }
@@ -225,6 +230,10 @@ const routes = {
       roundEndsAt: null,
       nextRoundAt: null,
       players: [newPlayer(body.playerId, body.username)],
+      approved: new Set([body.playerId]), // everyone who was let in once can come back after a wifi drop without asking again
+      pending: [],                         // join requests waiting for the host
+      declined: new Map(),
+      kicked: new Map(),
       chat: [], chatSeq: 0,
       reactions: [], reactSeq: 0,
       lastActive: Date.now(),
@@ -248,8 +257,53 @@ const routes = {
       return publicRoom(room, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
     }
     if (room.players.length >= MAX_PLAYERS) throw new HttpError(409, `Room is full (${MAX_PLAYERS}/${MAX_PLAYERS}).`);
+
+    // New people must be approved by the host first (people who were already let in once come straight back).
+    if (!room.approved.has(body.playerId)) {
+      room.declined.delete(body.playerId); // asking again after a decline is allowed
+      const name = cleanName(body.username);
+      const q = room.pending.find((x) => x.id === body.playerId);
+      if (q) { q.lastSeen = Date.now(); q.username = name; }
+      else room.pending.push({ id: body.playerId, username: name, lastSeen: Date.now() });
+      return { pending: true, roomId: room.id };
+    }
     room.players.push(newPlayer(body.playerId, body.username)); // joins mid-round -> spectates until next round
     return publicRoom(room, { chatSince: 0 }); // a new player gets the recent chat history
+  },
+
+  // The player who asked to join polls this: still waiting / approved (full room) / declined (403 DECLINED).
+  "GET /api/rooms/join-status": (_body, query) => {
+    const room = getRoom(query);
+    pruneRoom(room);
+    if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
+    if (wasKickedFromRoom(room, query.playerId)) throw new HttpError(403, "The host removed you from this room.", "KICKED");
+    if (room.players.some((p) => p.id === query.playerId)) {
+      const me = room.players.find((p) => p.id === query.playerId);
+      me.lastSeen = Date.now();
+      return publicRoom(room, { chatSince: 0 });
+    }
+    const q = room.pending.find((x) => x.id === query.playerId);
+    if (q) { q.lastSeen = Date.now(); return { pending: true, roomId: room.id }; }
+    if (room.declined.has(query.playerId)) throw new HttpError(403, "The host declined your request to join.", "DECLINED");
+    throw new HttpError(404, "Your request expired. Try joining again.", "EXPIRED");
+  },
+
+  // Host only: approve or decline a join request.
+  "POST /api/rooms/respond": (body) => {
+    const { room } = getMember(body);
+    if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can answer join requests.");
+    const view = () => publicRoom(room, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
+    const q = room.pending.find((x) => x.id === body.targetId);
+    if (!q) return view(); // already answered or expired
+    room.pending = room.pending.filter((x) => x.id !== body.targetId);
+    if (body.approve) {
+      if (room.players.length >= MAX_PLAYERS) throw new HttpError(409, `Room is full (${MAX_PLAYERS}/${MAX_PLAYERS}).`);
+      room.approved.add(q.id);
+      room.players.push(newPlayer(q.id, q.username)); // joins mid-round -> spectates until next round
+    } else {
+      room.declined.set(q.id, Date.now() + DECLINE_MEMORY_MS);
+    }
+    return view();
   },
 
   "GET /api/rooms/state": (_body, query) => {
