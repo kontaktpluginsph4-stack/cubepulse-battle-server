@@ -176,6 +176,15 @@ function throwIfKicked(playerId) {
   }
 }
 
+// Host kicks are remembered per room, so a kicked player cannot simply rejoin.
+function wasKickedFromRoom(room, playerId) {
+  if (!room.kicked) return false;
+  const until = room.kicked.get(playerId);
+  if (!until) return false;
+  if (until < Date.now()) { room.kicked.delete(playerId); return false; }
+  return true;
+}
+
 function getRoom(source) {
   const id = String(source.roomId || "").toUpperCase();
   const room = rooms.get(id);
@@ -193,6 +202,7 @@ function getMember(source) {
   const room = getRoom(source);
   const player = room.players.find((p) => p.id === source.playerId);
   if (!player) {
+    if (wasKickedFromRoom(room, source.playerId)) throw new HttpError(403, "The host removed you from the room.", "KICKED");
     throwIfKicked(source.playerId);
     throw new HttpError(403, "You are not in this room.");
   }
@@ -230,6 +240,7 @@ const routes = {
     pruneRoom(room);
     if (!rooms.has(room.id)) throw new HttpError(404, "Room not found.");
 
+    if (wasKickedFromRoom(room, body.playerId)) throw new HttpError(403, "The host removed you from this room.", "KICKED");
     const existing = room.players.find((p) => p.id === body.playerId);
     if (existing) {
       existing.lastSeen = Date.now();
@@ -352,6 +363,18 @@ const routes = {
     room.chat.push({ id: ++room.chatSeq, playerId: player.id, username: player.username, text, at: now });
     if (room.chat.length > CHAT_KEEP) room.chat = room.chat.slice(-CHAT_KEEP);
     return view();
+  },
+
+  // Host only: removes a player. That player gets 403 with code "KICKED" on their next poll.
+  "POST /api/rooms/kick": (body) => {
+    const { room } = getMember(body);
+    if (room.hostId !== body.playerId) throw new HttpError(403, "Only the host can kick players.");
+    if (!body.targetId || body.targetId === body.playerId) throw new HttpError(400, "You cannot kick yourself.");
+    if (!room.players.some((p) => p.id === body.targetId)) throw new HttpError(404, "That player is not in the room.");
+    if (!room.kicked) room.kicked = new Map();
+    room.kicked.set(body.targetId, Date.now() + KICK_MEMORY_MS);
+    removePlayer(room, body.targetId);
+    return publicRoom(room, { chatSince: Number(body.chatSince) || 0, reactSince: Number(body.reactSince) || room.reactSeq });
   },
 
   "POST /api/rooms/leave": (body) => {
