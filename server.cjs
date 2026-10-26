@@ -360,7 +360,7 @@ const routes = {
     return { ok: true };
   },
 
-  "GET /": () => ({ ok: true, service: "cubepulse-battle-server", rooms: rooms.size }),
+  "GET /": () => ({ ok: true, service: "cubepulse-battle-server", rooms: rooms.size, features: ["chat", "reactions", "streak"] }),
   "GET /health": () => ({ ok: true }),
 };
 
